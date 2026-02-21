@@ -1,30 +1,29 @@
-# loader_controller_worker.py
-# Render worker with heartbeat
+# loader_start_worker.py
+# Render Background Worker
+# Idempotent, duplicate-safe, multi-tenant safe
 
 import os
 import time
 import logging
-from datetime import datetime
-
 import psycopg2
 from psycopg2 import OperationalError
 from psycopg2.extras import RealDictCursor
 
 
-# =========================
+# =========================================================
 # Logging
-# =========================
+# =========================================================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("loader_controller_worker")
+log = logging.getLogger("loader_start_worker")
 
 
-# =========================
+# =========================================================
 # ENV
-# =========================
+# =========================================================
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
@@ -32,19 +31,21 @@ if not DATABASE_URL:
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 
-HEARTBEAT_SOURCE = "loader_controller_worker"
+HEARTBEAT_SOURCE = "loader_start_worker"
 
 
-# =========================
-# DB helpers
-# =========================
+# =========================================================
+# DB Connection
+# =========================================================
 def get_conn():
     return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
 
-# =========================
+# =========================================================
 # SQL
-# =========================
+# =========================================================
+
+# IMPORTANT: No date filter — process ALL unprocessed rows
 SELECT_ROWS_SQL = """
 SELECT
     rowid,
@@ -57,7 +58,6 @@ SELECT
 FROM loader_controller_log
 WHERE processed = false
   AND pos_receipt IS NOT NULL
-  AND (log_ts::date) = CURRENT_DATE
 ORDER BY log_ts ASC
 FOR UPDATE SKIP LOCKED
 LIMIT %s
@@ -73,9 +73,10 @@ WHERE tenant_id = %s
   AND location_id = %s
   AND created_on = %s
   AND bill = %s
+RETURNING bill;
 """
 
-UPDATE_SUPER_WASH_SQL = """
+UPDATE_SUPER_SQL = """
 UPDATE super
 SET
     status = 3,
@@ -86,7 +87,7 @@ WHERE tenant_id = %s
   AND bill = %s
 """
 
-UPDATE_TUNNEL_LOAD_SQL = """
+UPDATE_TUNNEL_SQL = """
 UPDATE tunnel
 SET
     load = true,
@@ -109,21 +110,19 @@ VALUES (%s, %s, %s)
 """
 
 
-# =========================
-# Worker logic
-# =========================
-def process_batch(conn) -> int:
-    """
-    Returns number of rows processed.
-    Also records which tenant/location pairs were touched.
-    """
+# =========================================================
+# Worker Logic
+# =========================================================
+def process_batch(conn):
     processed_count = 0
-    touched_pairs = set()  # (tenant_id, location_id)
+    touched_pairs = set()
 
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
             cur.execute(SELECT_ROWS_SQL, (BATCH_SIZE,))
             rows = cur.fetchall()
+
             if not rows:
                 return 0, touched_pairs
 
@@ -136,47 +135,54 @@ def process_batch(conn) -> int:
                 log_ts = r["log_ts"]
                 created_on = r["created_on"]
 
-                # Step 2: vehicle update (required)
+                # -------------------------------------------------
+                # Update vehicle (idempotent-safe)
+                # -------------------------------------------------
                 cur.execute(
                     UPDATE_VEHICLE_SQL,
                     (pos_receipt, tenant_id, location_id, created_on, bill),
                 )
-                if cur.rowcount != 1:
-                    log.warning(
-                        "Skipped rowid=%s: vehicle not updated tenant=%s location=%s bill=%s",
-                        rowid, tenant_id, location_id, bill
-                    )
-                    continue
+                vehicle_rows = cur.fetchall()
 
-                # Step 3: super (optional)
+                if not vehicle_rows:
+                    log.warning(
+                        "No vehicle row found → tenant=%s location=%s bill=%s",
+                        tenant_id, location_id, bill,
+                    )
+
+                # -------------------------------------------------
+                # Update super (optional)
+                # -------------------------------------------------
                 cur.execute(
-                    UPDATE_SUPER_WASH_SQL,
+                    UPDATE_SUPER_SQL,
                     (tenant_id, location_id, created_on, bill),
                 )
 
-                # Step 4: tunnel (optional)
+                # -------------------------------------------------
+                # Update tunnel (optional)
+                # -------------------------------------------------
                 cur.execute(
-                    UPDATE_TUNNEL_LOAD_SQL,
+                    UPDATE_TUNNEL_SQL,
                     (log_ts, tenant_id, location_id, created_on, bill),
                 )
 
-                # Step 5: mark processed
+                # -------------------------------------------------
+                # Mark processed (ALWAYS mark if we reached here)
+                # -------------------------------------------------
                 cur.execute(MARK_PROCESSED_SQL, (rowid,))
                 if cur.rowcount == 1:
                     processed_count += 1
                     touched_pairs.add((tenant_id, location_id))
                 else:
-                    log.warning("Failed to mark processed for rowid=%s", rowid)
+                    log.warning("Failed to mark processed rowid=%s", rowid)
 
     return processed_count, touched_pairs
 
 
+# =========================================================
+# Heartbeat
+# =========================================================
 def write_heartbeat(conn, touched_pairs):
-    """
-    Write heartbeat rows.
-    - If work happened → one per tenant/location touched
-    - If no work → one global heartbeat
-    """
     with conn:
         with conn.cursor() as cur:
             if touched_pairs:
@@ -186,13 +192,16 @@ def write_heartbeat(conn, touched_pairs):
                         (HEARTBEAT_SOURCE, tenant_id, location_id),
                     )
             else:
-                # Worker alive, no rows today
+                # Worker alive but no rows
                 cur.execute(
                     INSERT_HEARTBEAT_SQL,
                     (HEARTBEAT_SOURCE, None, None),
                 )
 
 
+# =========================================================
+# Main Loop
+# =========================================================
 def main():
     log.info(
         "Starting worker: poll=%ss batch=%s source=%s",
@@ -200,6 +209,7 @@ def main():
     )
 
     conn = None
+
     while True:
         try:
             if conn is None or conn.closed:
@@ -208,12 +218,16 @@ def main():
                 log.info("DB connected")
 
             processed, touched = process_batch(conn)
+
+            if processed:
+                log.info("Processed rows: %s", processed)
+
             write_heartbeat(conn, touched)
 
             time.sleep(POLL_SECONDS)
 
         except OperationalError as oe:
-            log.warning("DB error: %s (reconnecting)", oe)
+            log.warning("DB connection error: %s (reconnecting)", oe)
             try:
                 if conn:
                     conn.close()
