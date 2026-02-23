@@ -178,20 +178,31 @@ def process_batch(conn):
 # Heartbeat
 # =========================================================
 def write_heartbeat(conn, touched_pairs):
-    with conn:
-        with conn.cursor() as cur:
-            if touched_pairs:
-                for tenant_id, location_id in touched_pairs:
+    """
+    Heartbeat must never crash the worker.
+    If DB connection is stale, skip heartbeat quietly.
+    """
+    try:
+        if conn is None or conn.closed:
+            conn = get_conn()
+
+        with conn:
+            with conn.cursor() as cur:
+                if touched_pairs:
+                    for tenant_id, location_id in touched_pairs:
+                        cur.execute(
+                            INSERT_HEARTBEAT_SQL,
+                            (HEARTBEAT_SOURCE, tenant_id, location_id),
+                        )
+                else:
                     cur.execute(
                         INSERT_HEARTBEAT_SQL,
-                        (HEARTBEAT_SOURCE, tenant_id, location_id),
+                        (HEARTBEAT_SOURCE, None, None),
                     )
-            else:
-                cur.execute(
-                    INSERT_HEARTBEAT_SQL,
-                    (HEARTBEAT_SOURCE, None, None),
-                )
 
+    except psycopg2.Error as e:
+        # Heartbeat is non-critical; never escalate
+        log.debug("Heartbeat skipped (DB unavailable): %s", e)
 
 # =========================================================
 # Main Loop
