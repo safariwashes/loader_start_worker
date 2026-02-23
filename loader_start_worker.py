@@ -122,7 +122,7 @@ def process_batch(conn):
             rows = cur.fetchall()
 
             if not rows:
-                log.info("No eligible rows found in this cycle.")
+                log.debug("No eligible rows found in this cycle.")
                 return 0, touched_pairs
 
             log.info("Fetched %s rows for processing.", len(rows))
