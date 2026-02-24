@@ -14,7 +14,7 @@ from psycopg2.extras import RealDictCursor
 # ---------------------------------------------------
 # Logging
 # ---------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()  # DEBUG temporarily
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -42,11 +42,11 @@ def get_conn():
 
 SELECT_TUNNEL_ROWS = """
 SELECT
-    t.id,
+    t.bill,
+    t.location,
+    t.created_on,
     t.tenant_id,
     t.location_id,
-    t.bill,
-    t.created_on,
     t.load_time,
     l.length_sec
 FROM tunnel t
@@ -83,7 +83,9 @@ UPDATE_TUNNEL_EXIT_SQL = """
 UPDATE tunnel
 SET exit = true,
     exit_time = NOW()
-WHERE id = %s;
+WHERE bill = %s
+  AND location = %s
+  AND created_on = %s;
 """
 
 INSERT_HEARTBEAT_SQL = """
@@ -102,52 +104,76 @@ def process_batch(conn):
 
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
+    log.debug("Selecting tunnel rows...")
+
     cur.execute(SELECT_TUNNEL_ROWS, (BATCH_SIZE,))
     rows = cur.fetchall()
 
     if not rows:
+        log.debug("No eligible tunnel rows found.")
         cur.close()
         return 0, touched
+
+    log.debug("Fetched %s tunnel rows", len(rows))
 
     cur.execute("SELECT NOW();")
     now = cur.fetchone()["now"]
 
     for r in rows:
-        tunnel_id = r["id"]
+        bill = r["bill"]
+        location = r["location"]
+        created_on = r["created_on"]
         tenant_id = r["tenant_id"]
         location_id = r["location_id"]
-        bill = r["bill"]
-        created_on = r["created_on"]
         load_time = r["load_time"]
         length_sec = r["length_sec"]
 
-        if now >= load_time + timedelta(seconds=length_sec):
+        exit_due_time = load_time + timedelta(seconds=length_sec)
 
-            log.info(
-                "Exit triggered: tunnel_id=%s bill=%s",
-                tunnel_id, bill
-            )
+        log.debug(
+            "Evaluating bill=%s load_time=%s length=%s exit_due=%s now=%s",
+            bill, load_time, length_sec, exit_due_time, now
+        )
+
+        if now >= exit_due_time:
+
+            log.info("Exit triggered for bill=%s", bill)
 
             # 1️⃣ Update vehicle
             cur.execute(
                 UPDATE_VEHICLE_SQL,
                 (tenant_id, location_id, created_on, bill),
             )
+            log.debug("Vehicle rows updated: %s", cur.rowcount)
 
-            # 2️⃣ Update super (optional)
+            # 2️⃣ Update super
             cur.execute(
                 UPDATE_SUPER_SQL,
                 (tenant_id, location_id, created_on, bill),
             )
+            log.debug("Super rows updated: %s", cur.rowcount)
 
             # 3️⃣ Update tunnel LAST
             cur.execute(
                 UPDATE_TUNNEL_EXIT_SQL,
-                (tunnel_id,),
+                (bill, location, created_on),
             )
+            log.debug("Tunnel rows updated: %s", cur.rowcount)
+
+            if cur.rowcount == 0:
+                log.error(
+                    "Tunnel UPDATE FAILED for bill=%s (no rows affected!)",
+                    bill
+                )
 
             processed += 1
             touched.add((tenant_id, location_id))
+
+        else:
+            log.debug(
+                "Skipping bill=%s (exit not due yet)",
+                bill
+            )
 
     conn.commit()
     cur.close()
@@ -171,6 +197,7 @@ def write_heartbeat(conn, touched):
             )
         conn.commit()
         cur.close()
+        log.debug("Heartbeat written.")
     except Exception as e:
         log.debug("Heartbeat skipped: %s", e)
 
