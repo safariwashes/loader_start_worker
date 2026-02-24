@@ -1,24 +1,14 @@
 services:
   - type: worker
-    name: loader-start-worker
+    name: loader-combined-worker
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python loader_start_worker.py
+    startCommand: python loader_combined_worker.py
     envVars:
       - key: DATABASE_URL
-        sync: false
-      - key: POLL_SECONDS
-        value: "2"
-
-  - type: worker
-    name: loader-end-worker
-    runtime: python
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: python loader_end_worker.py
-    envVars:
-      - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: safari-franklin-one
+          property: connectionString
       - key: POLL_SECONDS
         value: "2"
