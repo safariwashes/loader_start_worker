@@ -4,11 +4,16 @@
 import os
 import time
 import logging
+from datetime import timedelta
+
 import psycopg2
 from psycopg2 import OperationalError
 from psycopg2.extras import RealDictCursor
 
 
+# ---------------------------------------------------
+# Logging
+# ---------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -16,6 +21,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("loader_end_worker")
 
+
+# ---------------------------------------------------
+# ENV
+# ---------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "2"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
@@ -45,7 +54,6 @@ JOIN tunnel_length l
   ON l.tenant_id = t.tenant_id
  AND l.location_id = t.location_id
 WHERE t.exit = false
-  AND t.created_on = CURRENT_DATE
   AND t.load_time IS NOT NULL
 FOR UPDATE SKIP LOCKED
 LIMIT %s;
@@ -92,82 +100,77 @@ def process_batch(conn):
     processed = 0
     touched = set()
 
-    with conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+    cur = conn.cursor(cursor_factory=RealDictCursor)
 
-            cur.execute(SELECT_TUNNEL_ROWS, (BATCH_SIZE,))
-            rows = cur.fetchall()
+    cur.execute(SELECT_TUNNEL_ROWS, (BATCH_SIZE,))
+    rows = cur.fetchall()
 
-            if not rows:
-                return 0, touched
+    if not rows:
+        cur.close()
+        return 0, touched
 
-            now = None
-            cur.execute("SELECT NOW();")
-            now = cur.fetchone()["now"]
+    cur.execute("SELECT NOW();")
+    now = cur.fetchone()["now"]
 
-            for r in rows:
+    for r in rows:
+        tunnel_id = r["id"]
+        tenant_id = r["tenant_id"]
+        location_id = r["location_id"]
+        bill = r["bill"]
+        created_on = r["created_on"]
+        load_time = r["load_time"]
+        length_sec = r["length_sec"]
 
-                tunnel_id = r["id"]
-                tenant_id = r["tenant_id"]
-                location_id = r["location_id"]
-                bill = r["bill"]
-                created_on = r["created_on"]
-                load_time = r["load_time"]
-                length_sec = r["length_sec"]
+        if now >= load_time + timedelta(seconds=length_sec):
 
-                exit_due_time = load_time + \
-                    psycopg2.extensions.adapt(
-                        f"{length_sec} seconds"
-                    )
+            log.info(
+                "Exit triggered: tunnel_id=%s bill=%s",
+                tunnel_id, bill
+            )
 
-                # Compare in SQL-safe way
-                from datetime import timedelta
-                if now >= load_time + timedelta(seconds=length_sec):
+            # 1️⃣ Update vehicle
+            cur.execute(
+                UPDATE_VEHICLE_SQL,
+                (tenant_id, location_id, created_on, bill),
+            )
 
-                    log.info(
-                        "Exit triggered: tunnel_id=%s bill=%s",
-                        tunnel_id, bill
-                    )
+            # 2️⃣ Update super (optional)
+            cur.execute(
+                UPDATE_SUPER_SQL,
+                (tenant_id, location_id, created_on, bill),
+            )
 
-                    # 1️⃣ Update vehicle
-                    cur.execute(
-                        UPDATE_VEHICLE_SQL,
-                        (tenant_id, location_id, created_on, bill),
-                    )
+            # 3️⃣ Update tunnel LAST
+            cur.execute(
+                UPDATE_TUNNEL_EXIT_SQL,
+                (tunnel_id,),
+            )
 
-                    # 2️⃣ Update super (optional)
-                    cur.execute(
-                        UPDATE_SUPER_SQL,
-                        (tenant_id, location_id, created_on, bill),
-                    )
+            processed += 1
+            touched.add((tenant_id, location_id))
 
-                    # 3️⃣ Update tunnel LAST
-                    cur.execute(
-                        UPDATE_TUNNEL_EXIT_SQL,
-                        (tunnel_id,)
-                    )
-
-                    processed += 1
-                    touched.add((tenant_id, location_id))
+    conn.commit()
+    cur.close()
 
     return processed, touched
 
 
 def write_heartbeat(conn, touched):
     try:
-        with conn:
-            with conn.cursor() as cur:
-                if touched:
-                    for tenant_id, location_id in touched:
-                        cur.execute(
-                            INSERT_HEARTBEAT_SQL,
-                            (HEARTBEAT_SOURCE, tenant_id, location_id)
-                        )
-                else:
-                    cur.execute(
-                        INSERT_HEARTBEAT_SQL,
-                        (HEARTBEAT_SOURCE, None, None)
-                    )
+        cur = conn.cursor()
+        if touched:
+            for tenant_id, location_id in touched:
+                cur.execute(
+                    INSERT_HEARTBEAT_SQL,
+                    (HEARTBEAT_SOURCE, tenant_id, location_id)
+                )
+        else:
+            cur.execute(
+                INSERT_HEARTBEAT_SQL,
+                (HEARTBEAT_SOURCE, None, None)
+            )
+        conn.commit()
+        cur.close()
     except Exception as e:
         log.debug("Heartbeat skipped: %s", e)
 
@@ -185,7 +188,6 @@ def main():
         try:
             if conn is None or conn.closed:
                 conn = get_conn()
-                conn.autocommit = False
                 log.info("DB connected")
 
             processed, touched = process_batch(conn)
@@ -199,8 +201,11 @@ def main():
 
         except OperationalError as oe:
             log.warning("DB error: %s (reconnecting)", oe)
-            if conn:
-                conn.close()
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
             conn = None
             time.sleep(2)
 
