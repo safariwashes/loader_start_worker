@@ -1,1 +1,3 @@
-psycopg2-binary==2.9.9
+psycopg v3
+pytz
+python-dotenv
